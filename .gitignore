@@ -1,0 +1,40 @@
+# === Checkmk Auto-Generated Files (Don't version) ===
+# Files often generated within conf.d/wato/
+/etc/checkmk/conf.d/wato/activation_errors
+/etc/checkmk/conf.d/wato/audit.log
+/etc/checkmk/conf.d/wato/logwatch.cfg
+/etc/checkmk/conf.d/wato/folder_properties.mk # Properties set via WATO folders
+/etc/checkmk/conf.d/wato/.wato                # WATO internal state
+/etc/checkmk/conf.d/wato/users.mk             # User configurations (unless explicitly managed)
+/etc/checkmk/conf.d/wato/groups.mk            # Group configurations (unless explicitly managed)
+/etc/checkmk/conf.d/wato/rulesets.mk          # Usually generated from individual rule files
+/etc/checkmk/conf.d/wato/hosts.mk             # Often generated from individual host files (like ours)
+
+# Site secrets and runtime data
+/etc/checkmk/auth.secret
+/etc/checkmk/auth.serials
+/etc/checkmk/multisite.secret
+/etc/checkmk/apache.conf
+/etc/checkmk/settings.mk # Generated GUI settings
+/etc/checkmk/local/migrated/ # Migration backups
+
+# Checkmk var directory contents (should never be in git)
+/var/
+
+# General temporary/system files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Editor/IDE specific folders
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
