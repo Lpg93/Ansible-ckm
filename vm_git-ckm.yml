@@ -1,0 +1,549 @@
+# Ansible Playbook Completo - Instalación Servidor Checkmk (v4 - Git Init + Basic Monitoring)
+# ... (Play 1 y Play 2 se mantienen igual que en tu versión original) ...
+
+# --- Play 1: Clone VM, Configure via qm set, Prepare Connection ---
+# (Sin cambios respecto a tu versión)
+- name: Play 1 - Clone VM, Configure via qm set, and Prepare Connection
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # --- Variables de Conexión a Proxmox ---
+    proxmox_api_host: "10.77.0.60"
+    proxmox_api_user: "root@pam"
+    proxmox_api_token_id: "ansible-token"
+    proxmox_api_token_secret: "eb0004d7-231b-4135-983d-c690d00edb18"
+    proxmox_validate_certs: false
+    # --- Variables del Nodo Proxmox ---
+    proxmox_node: "lau"
+    proxmox_node_ip: "10.77.0.60" # IP del nodo físico
+    # --- Variables de la Plantilla ---
+    template_vm_name: "ubuntu-template-30g"
+    # --- Variables para la Nueva VM ---
+    clone_vm_id: 155
+    clone_vm_name: "test-vm-{{ clone_vm_id }}"
+    new_vm_ip: "10.77.0.67"
+    network_cidr: "24"
+    network_gateway: "10.77.0.250"
+    vm_ci_password_plaintext: "root1"
+    # --- Info SSH NUEVA VM ---
+    vm_ssh_user: "ubuntu"
+    ssh_private_key_path: "~/.ssh/id_rsa"
+    ssh_public_key: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
+    # --- Temp file en Nodo Proxmox ---
+    ssh_key_temp_path_on_node: "/tmp/ansible_sshkey_{{ clone_vm_id }}.pub"
+  tasks:
+    # 1. Clonar
+    - name: "Clone template '{{ template_vm_name }}' to VM {{ clone_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        clone: "{{ template_vm_name }}"
+        newid: "{{ clone_vm_id }}"
+        name: "{{ clone_vm_name }}"
+        state: present
+        timeout: 300
+      register: clone_result
+    # 2. Bloque: Copiar clave, qm set, limpiar clave
+    - name: Manage SSH Key Temp File and Configure VM via qm set
+      delegate_to: "{{ proxmox_node_ip }}"
+      remote_user: root
+      become: false
+      when: clone_result is defined and clone_result is not failed
+      block:
+        # 2.1 Copiar la clave SSH pública al nodo Proxmox
+        - name: Copy SSH public key to temporary file on Proxmox node
+          ansible.builtin.copy:
+            content: "{{ ssh_public_key }}"
+            dest: "{{ ssh_key_temp_path_on_node }}"
+            owner: root
+            group: root
+            mode: '0600'
+        # 2.2 Configurar Cloud-Init usando 'qm set'
+        - name: Configure Cloud-Init using qm set with temp key file
+          ansible.builtin.shell:
+            cmd: >
+              qm set {{ clone_vm_id }}
+              --ciuser {{ vm_ssh_user }}
+              --cipassword {{ vm_ci_password_plaintext }}
+              --sshkeys {{ ssh_key_temp_path_on_node }}
+              --ipconfig0 ip={{ new_vm_ip }}/{{ network_cidr }},gw={{ network_gateway }}
+          register: qm_set_result
+          changed_when: qm_set_result.rc == 0
+      always:
+        # 2.3 Eliminar el archivo temporal
+        - name: Remove SSH key temporary file from Proxmox node
+          delegate_to: "{{ proxmox_node_ip }}"
+          remote_user: root
+          become: false
+          ansible.builtin.file:
+            path: "{{ ssh_key_temp_path_on_node }}"
+            state: absent
+          ignore_errors: true
+    # 3. Iniciar VM
+    - name: "Start the configured VM {{ clone_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ clone_vm_id }}"
+        state: started
+        timeout: 120
+      when:
+        - clone_result is defined and clone_result is not failed
+        - qm_set_result is defined and qm_set_result is succeeded
+    # 4. Añadir Host a Inventario
+    - name: "Add VM {{ clone_vm_name }} (IP: {{ new_vm_ip }}) to inventory group 'checkmk_server'"
+      ansible.builtin.add_host:
+        name: "{{ new_vm_ip }}"
+        groups: checkmk_server
+        ansible_user: "{{ vm_ssh_user }}"
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path | expanduser }}"
+        # NUEVO: Añadir variables útiles para plays posteriores
+        ansible_host_vars:
+          checkmk_server_hostname: "{{ clone_vm_name }}" # Guardamos el nombre para usarlo después
+      when:
+        - clone_result is defined and clone_result is not failed
+        - qm_set_result is defined and qm_set_result is succeeded
+
+# --- Play 2: Wait for SSH on New VM and Test Connection ---
+# (Sin cambios respecto a tu versión)
+- name: Play 2 - Wait for SSH on New Server VM and Test Connection
+  hosts: checkmk_server
+  gather_facts: false # MODIFICADO: Gather facts aquí para tener ansible_hostname etc.
+  become: false
+  tasks:
+    - name: "Wait for SSH port 22 on {{ inventory_hostname }}"
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}"
+        port: 22
+        delay: 30
+        timeout: 300
+        state: started
+      delegate_to: localhost
+    - name: Gather facts from the new VM (Test connection and get info) # MODIFICADO
+      ansible.builtin.gather_facts: {}
+    - name: Test SSH connection using ping module
+      ansible.builtin.ping:
+    - name: Display connection success message
+      ansible.builtin.debug:
+        msg: "SSH Connection to {{ inventory_hostname }} (Hostname: {{ ansible_hostname }}) successful!"
+
+
+# --- Play 3: Prepare OS Dependencies for Checkmk SERVER ---
+- name: Play 3 - Prepare OS Dependencies for Checkmk Server
+  hosts: checkmk_server
+  gather_facts: false # Ya los recogimos en Play 2
+  become: yes
+  vars:
+    server_base_dependencies:
+      - wget
+      - ca-certificates
+      - postfix
+      - gnupg
+      - apt-transport-https
+      - git  # NUEVO: Añadido Git para clonar el repo
+  tasks:
+    # 1. Wait for cloud-init (Sin cambios)
+    - name: Wait for cloud-init to finish first boot setup
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init_status
+      changed_when: "'status: done' in cloud_init_status.stdout"
+      failed_when: "cloud_init_status.rc != 0 and 'status: done' not in cloud_init_status.stdout"
+      until: "'status: done' in cloud_init_status.stdout"
+      retries: 8
+      delay: 30
+
+    # 2. Show cloud-init status (Sin cambios)
+    - name: Show cloud-init final status
+      ansible.builtin.debug:
+        msg: "Cloud-init finished. RC={{ cloud_init_status.rc }}, STDOUT={{ cloud_init_status.stdout }}"
+      when: cloud_init_status is defined
+
+    # 3. Update apt cache (Sin cambios)
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      register: apt_update_result
+      until: apt_update_result is succeeded
+      retries: 5
+      delay: 15
+      when:
+        - cloud_init_status is defined
+        - cloud_init_status.rc == 0 or 'status: done' in cloud_init_status.stdout
+
+    # 4. Pre-seed postfix - Type (Sin cambios)
+    - name: Pre-seed postfix configuration - Type
+      ansible.builtin.debconf:
+        name: postfix
+        question: postfix/main_mailer_type
+        value: 'Internet Site'
+        vtype: select
+      when:
+        - cloud_init_status is defined
+        - cloud_init_status.rc == 0 or 'status: done' in cloud_init_status.stdout
+        - apt_update_result is succeeded
+
+    # 5. Pre-seed postfix - Mail Name (Sin cambios)
+    - name: Pre-seed postfix configuration - Mail Name
+      ansible.builtin.debconf:
+        name: postfix
+        question: postfix/mailname
+        # MODIFICADO: Usar ansible_hostname obtenido de gather_facts
+        value: "{{ ansible_hostname | default(inventory_hostname) }}"
+        vtype: string
+      when:
+        - cloud_init_status is defined
+        - cloud_init_status.rc == 0 or 'status: done' in cloud_init_status.stdout
+        - apt_update_result is succeeded
+
+    # 6. Install base server dependencies (MODIFICADO para incluir git)
+    - name: Install base server dependencies (including git)
+      ansible.builtin.apt:
+        name: "{{ server_base_dependencies }}" # Lista ahora incluye git
+        state: present
+        update_cache: no
+      register: apt_install_deps_result
+      until: apt_install_deps_result is succeeded
+      retries: 5
+      delay: 20
+      when:
+        - cloud_init_status is defined
+        - cloud_init_status.rc == 0 or 'status: done' in cloud_init_status.stdout
+        - apt_update_result is succeeded
+
+    # 7. Display deps success (Sin cambios)
+    - name: Display base dependencies installation success
+      ansible.builtin.debug:
+        msg: "Base server dependencies (including postfix and git) installed successfully."
+      when: apt_install_deps_result is succeeded
+
+    # 8. Create user 'lau' (Sin cambios)
+    - name: Create user 'lau'
+      ansible.builtin.user:
+        name: lau
+        state: present
+        password: "{{ 'root1'  }}" # MODIFICADO: Usar password_hash
+        groups: sudo
+        append: yes
+        create_home: yes
+        shell: /bin/bash
+      when: apt_install_deps_result is succeeded
+
+    # 9. Create user 'guest' (Sin cambios)
+    - name: Create user 'guest'
+      ansible.builtin.user:
+        name: guest
+        state: present
+        password: "{{ 'root1' }}" # MODIFICADO: Usar password_hash
+        create_home: yes
+        shell: /bin/bash
+      when: apt_install_deps_result is succeeded
+
+    # 10. Display user success (Sin cambios)
+    - name: Display OS user creation success
+      ansible.builtin.debug:
+        msg: "OS users 'lau' (with sudo) and 'guest' (no sudo) created successfully."
+      when: apt_install_deps_result is succeeded
+
+# --- Play 4: Install Checkmk, Init from Git, Add Basic Monitoring, Set Password ---
+- name: Play 4 - Install Checkmk, Init from Git, Add Basic Monitoring, Set Password
+  hosts: checkmk_server
+  gather_facts: false # Ya los tenemos
+  become: yes
+  vars:
+    checkmk_server_download_url: "https://download.checkmk.com/checkmk/2.3.0p30/check-mk-raw-2.3.0p30_0.noble_amd64.deb"
+    checkmk_tmp_deb_path: "/tmp/checkmk-installer.deb"
+    checkmk_site_name: "monitor"
+    checkmk_admin_password: "root1" # ¡Cambia esto en producción y usa Vault!
+    # NUEVO: Variables para Git
+    checkmk_config_git_repo: "https://github.com/Lpg93/Ansible-ckm.git"
+    checkmk_config_git_branch: "main"
+    checkmk_config_tmp_path: "/tmp/checkmk_initial_config_{{ checkmk_site_name }}"
+    # NUEVO: Ruta base del sitio OMD
+    omd_site_root: "/omd/sites/{{ checkmk_site_name }}"
+
+
+    ansible_managed: "Ansible managed: Do not edit manually!" # Puedes personalizar este texto
+
+  tasks:
+    # 1. Descargar Checkmk (Sin cambios)
+    - name: Download Checkmk Server package (.deb)
+      ansible.builtin.get_url:
+        url: "{{ checkmk_server_download_url }}"
+        dest: "{{ checkmk_tmp_deb_path }}"
+        mode: '0644'
+        validate_certs: yes
+      register: download_result
+      until: download_result is succeeded
+      retries: 3
+      delay: 10
+
+    # 2. Instalar Checkmk (Sin cambios)
+    - name: Install Checkmk server from downloaded .deb package
+      ansible.builtin.apt:
+        deb: "{{ checkmk_tmp_deb_path }}"
+        state: present
+        update_cache: no
+      register: apt_install_cmk_result
+      until: apt_install_cmk_result is succeeded
+      retries: 3
+      delay: 20
+      when: download_result is succeeded
+
+    # 3. Crear sitio OMD (Sin cambios)
+    - name: Create OMD monitoring site '{{ checkmk_site_name }}'
+      ansible.builtin.shell:
+        cmd: "omd create --admin-password {{ checkmk_admin_password | quote }} {{ checkmk_site_name }}" # Intenta poner pass aquí
+        creates: "{{ omd_site_root }}/etc" # Usar var omd_site_root
+      register: omd_create_result
+      changed_when: "'Created new site' in omd_create_result.stdout"
+      failed_when: omd_create_result.rc != 0 and 'already exists' not in omd_create_result.stderr
+      when: apt_install_cmk_result is succeeded
+
+    # 4. Iniciar sitio OMD (Temporalmente, para que exista el user)
+    - name: Start OMD monitoring site '{{ checkmk_site_name }}' (initial start)
+      ansible.builtin.shell:
+        cmd: "omd start {{ checkmk_site_name }}"
+      register: omd_start_result_initial # Renombrado registro
+      changed_when: "'Starting apache...OK' in omd_start_result_initial.stdout"
+      failed_when: omd_start_result_initial.rc != 0 and 'is already running' not in omd_start_result_initial.stdout
+      when:
+        - apt_install_cmk_result is succeeded
+        - omd_create_result is defined and (omd_create_result.rc == 0 or 'already exists' in omd_create_result.stderr)
+
+    # --- NUEVO: Bloque para manejar configuración Git ---
+    - name: Manage Git Configuration Import
+      become: yes # Necesario para escribir en /tmp y luego en /omd/sites
+      when:
+        # Solo si el sitio se creó o ya existía y se inició correctamente
+        - omd_start_result_initial is defined
+        - omd_start_result_initial.rc == 0 or 'is already running' in omd_start_result_initial.stdout
+      block:
+        # 5. Clonar repositorio Git de configuración
+        - name: Clone Checkmk configuration from Git repository
+          ansible.builtin.git:
+            repo: "{{ checkmk_config_git_repo }}"
+            dest: "{{ checkmk_config_tmp_path }}"
+            version: "{{ checkmk_config_git_branch }}"
+            force: yes # Asegura que tenemos la última versión de la rama
+          register: git_clone_result
+
+        # 6. Copiar configuración desde Git al sitio OMD
+        - name: Copy configuration files from Git clone to OMD site etc/checkmk
+          ansible.builtin.copy:
+            remote_src: yes # ¡Importante! Copia dentro del host remoto
+            src: "{{ checkmk_config_tmp_path }}/" # Copia el contenido del directorio
+            dest: "{{ omd_site_root }}/etc/checkmk/" # Directorio base de config
+            owner: "{{ checkmk_site_name }}"
+            group: "{{ checkmk_site_name }}"
+            mode: 'preserve' # Preserva permisos del repo si es posible
+          when: git_clone_result is succeeded
+          register: git_copy_result
+          notify: Restart OMD site # Notifica reinicio si se copian archivos
+
+      always:
+        # 7. Limpiar el repositorio clonado temporal
+        - name: Clean up temporary Git clone directory
+          ansible.builtin.file:
+            path: "{{ checkmk_config_tmp_path }}"
+            state: absent
+          # No fallar si el directorio no existe por alguna razón
+          ignore_errors: true
+
+    # --- NUEVO: Bloque para añadir configuración básica ---
+    - name: Add Basic Ansible-Managed Monitoring Configuration
+      become: yes # Necesario para escribir en /omd/sites
+      when:
+        # Solo si el sitio se creó o ya existía y se inició correctamente
+        - omd_start_result_initial is defined
+        - omd_start_result_initial.rc == 0 or 'is already running' in omd_start_result_initial.stdout
+      block:
+        # 8. Asegurar que el directorio wato existe
+        - name: Ensure WATO config directory exists
+          ansible.builtin.file:
+            path: "{{ omd_site_root }}/etc/checkmk/conf.d/wato"
+            state: directory
+            owner: "{{ checkmk_site_name }}"
+            group: "{{ checkmk_site_name }}"
+            mode: '0775' # Permisos estándar para directorios de sitio
+
+        # 9. Crear archivo de hosts básicos (Servidor Cmk + Google DNS)
+        - name: Create basic hosts definition file (ansible_hosts.mk)
+          ansible.builtin.copy:
+            dest: "{{ omd_site_root }}/etc/checkmk/conf.d/wato/ansible_hosts.mk"
+            owner: "{{ checkmk_site_name }}"
+            group: "{{ checkmk_site_name }}"
+            mode: '0664' # Permisos estándar
+            content: |
+              # Managed by Ansible - Basic Hosts
+              # {{ ansible_managed }}
+
+              all_hosts += [
+                # El propio servidor Checkmk (usando el hostname resuelto por facts)
+                '{{ ansible_hostname }}|cmk-server|lan|prod|monitoring-server|site:{{ checkmk_site_name }}',
+                # Host para ping a Google DNS
+                'google_dns|external|wan|prod|ping-only',
+              ]
+
+              # Asignar IP al servidor Checkmk (usando el hostname como alias y la IP real)
+              host_attributes.update({
+                '{{ ansible_hostname }}': {
+                  'ipaddress': '{{ ansible_default_ipv4.address }}',
+                  'alias': '{{ ansible_hostname }} (Checkmk Server)',
+                  'tag_agent': 'cmk-agent', # Asume agente estándar
+                },
+                'google_dns': {
+                  'ipaddress': '8.8.8.8',
+                  'alias': 'Google Public DNS',
+                  'tag_agent': 'no-agent', # No usa agente
+                  'tag_criticality': 'prod', # Criticidad productiva
+                }
+              })
+          register: ansible_hosts_mk_result
+          notify: Restart OMD site # Notifica reinicio si se crea/cambia
+
+        # 10. Crear archivo de reglas básicas (Ping a Google)
+        - name: Create basic rules definition file (ansible_rules.mk)
+          ansible.builtin.copy:
+            dest: "{{ omd_site_root }}/etc/checkmk/conf.d/wato/ansible_rules.mk"
+            owner: "{{ checkmk_site_name }}"
+            group: "{{ checkmk_site_name }}"
+            mode: '0664'
+            content: |
+              # Managed by Ansible - Basic Rules
+              # {{ ansible_managed }}
+
+              ruleset_rules['active_checks:check_ping'] = [
+                ( {'comment': u'Ping external Google DNS', 'value': {'fixed_ip': '8.8.8.8'}}, [], ['google_dns'] ),
+              ] + ruleset_rules.get('active_checks:check_ping', [])
+
+              # Regla para activar monitoreo SNMP básico si el host tiene la etiqueta snmp-v2 (ejemplo)
+              # ruleset_rules['snmp_check_interval'] = [
+              #  ( {'comment': u'Standard SNMP check interval', 'value': 120}, [], ['snmp-v2'], None),
+              # ] + ruleset_rules.get('snmp_check_interval', [])
+
+              # Aquí podrías añadir más reglas básicas si lo necesitas
+              # Ejemplo: Forzar un intervalo específico para CPU en el servidor Cmk
+              # ruleset_rules['inventory_check_interval'] = [
+              #  ( {'comment': u'Faster CPU/Mem check on CMK server', 'value': 60}, ['{{ ansible_hostname }}'], ['check_mk-kernel.util', 'check_mk-mem.used']),
+              # ] + ruleset_rules.get('inventory_check_interval', [])
+          register: ansible_rules_mk_result
+          notify: Restart OMD site # Notifica reinicio si se crea/cambia
+
+    # 11. Establecer contraseña de cmkadmin (se mantiene, como pediste)
+    - name: Set password for cmkadmin user using cmk-passwd via su
+      ansible.builtin.shell:
+        cmd: >
+          su - {{ checkmk_site_name }} -s /bin/bash -c
+          "echo {{ checkmk_admin_password | quote }} | cmk-passwd --stdin cmkadmin"
+      args:
+        executable: /bin/bash
+      register: cmk_passwd_result_su
+      changed_when: cmk_passwd_result_su.rc == 0
+      failed_when: cmk_passwd_result_su.rc != 0
+      when:
+        # Ejecutar si el sitio se inició bien inicialmente
+        - omd_start_result_initial is defined
+        - omd_start_result_initial.rc == 0 or 'is already running' in omd_start_result_initial.stdout
+      # No notifica reinicio aquí, el handler se encarga si hubo cambios de config
+
+    # 12. Forzar ejecución de handlers (para asegurar reinicio si hubo cambios)
+    - name: Flush handlers to ensure OMD restart if needed
+      ansible.builtin.meta: flush_handlers
+
+    # 13. Verificar estado final del sitio OMD
+    - name: Verify OMD site '{{ checkmk_site_name }}' status after config changes
+      ansible.builtin.command:
+        cmd: "omd status {{ checkmk_site_name }}"
+      register: omd_status_result
+      changed_when: false
+      failed_when: omd_status_result.rc != 0
+      when:
+        # Solo verificar si el sitio se inició bien inicialmente
+        - omd_start_result_initial is defined
+        - omd_start_result_initial.rc == 0 or 'is already running' in omd_start_result_initial.stdout
+
+    # 14. Mensaje final (Sin cambios en el texto)
+    - name: Display Checkmk Web UI Access Info
+      ansible.builtin.debug:
+        msg: |
+          Checkmk Server Installation, Git Init, Basic Monitoring Setup, and Site '{{ checkmk_site_name }}' Configuration Completed!
+          Access the Web UI at: http://{{ inventory_hostname }}/{{ checkmk_site_name }}/
+          Login: cmkadmin
+          Password: {{ checkmk_admin_password }} (Set by Ansible)
+          Initial configuration pulled from: {{ checkmk_config_git_repo }} (branch: {{ checkmk_config_git_branch }})
+          Basic monitoring for localhost and Google DNS ping added by Ansible.
+          Firewall rules will be configured in the next play.
+      when: omd_status_result is succeeded
+
+      
+      
+# --- NUEVO: Handlers para Play 4 ---
+  handlers:
+    - name: Restart OMD site
+      listen: Restart OMD site # Nombre del listener que coincide con 'notify'
+      ansible.builtin.shell:
+        cmd: "omd restart {{ checkmk_site_name }}"
+      register: omd_restart_handler_result
+      # Descripción de la condición failed_when:
+      # No queremos que el playbook falle si 'omd restart' devuelve un código de error (rc != 0)
+      # *excepto* si el error específico es que el comando 'omd' no se encuentra
+      # ('omd: command not found' en stderr), lo cual indicaría un problema de instalación más grave.
+      # Otros errores (como que el sitio ya se esté reiniciando) no detendrán el playbook.
+      failed_when: omd_restart_handler_result.rc != 0 and 'omd":"" command not found' not in omd_restart_handler_result.stderr
+      # Consideramos que hubo un cambio si la salida contiene 'Restarting...'
+      changed_when: "'Restarting...' in omd_restart_handler_result.stdout"
+
+    - name: Pause after OMD restart handler
+      # Este handler también escucha el mismo 'notify' y se ejecuta DESPUÉS del reinicio.
+      listen: Restart OMD site
+      ansible.builtin.pause:
+        seconds: 15 # Pausa para dar tiempo a que los servicios del sitio se estabilicen
+
+    
+
+    
+
+
+# --- Play 5: Configurar Firewall (UFW) ---
+# (Sin cambios respecto a tu versión, pero asegúrate que UFW está instalado si no es parte de la plantilla base)
+- name: Play 5 - Configure Firewall (UFW)
+  hosts: checkmk_server
+  gather_facts: false
+  become: yes
+  tasks:
+    - name: Ensure UFW is installed
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+    - name: Allow incoming SSH connections
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+      notify: Enable UFW
+    - name: Allow incoming HTTP connections (Port 80)
+      community.general.ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
+      notify: Enable UFW
+      # NUEVO: Allow Checkmk Agent port (si planeas monitorear otros hosts)
+    - name: Allow incoming Checkmk Agent connections (Port 6556/TCP)
+      community.general.ufw:
+        rule: allow
+        port: '6556'
+        proto: tcp
+      notify: Enable UFW
+
+  handlers:
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled
