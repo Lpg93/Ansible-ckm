@@ -1,0 +1,477 @@
+# --- Play 1: Clone VM, Configure via qm set, Prepare Connection ---
+# (Sin cambios respecto a tu versión)
+- name: Play 1 - Clone VM, Configure via qm set, and Prepare Connection
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # --- Variables de Conexión a Proxmox ---
+    proxmox_api_host: "10.77.0.60"
+    proxmox_api_user: "root@pam"
+    proxmox_api_token_id: "ansible-token"
+    proxmox_api_token_secret: "eb0004d7-231b-4135-983d-c690d00edb18"
+    proxmox_validate_certs: false
+    # --- Variables del Nodo Proxmox ---
+    proxmox_node: "lau"
+    proxmox_node_ip: "10.77.0.60" # IP del nodo físico
+    # --- Variables de la Plantilla ---
+    template_vm_name: "ubuntu-template-30g"
+    # --- Variables para la Nueva VM ---
+    clone_vm_id: 222
+    clone_vm_name: "test-vm-{{ clone_vm_id }}"
+    new_vm_ip: "10.77.0.67"
+    network_cidr: "24"
+    network_gateway: "10.77.0.250"
+    vm_ci_password_plaintext: "root1"
+    # --- Info SSH NUEVA VM ---
+    vm_ssh_user: "ubuntu"
+    ssh_private_key_path: "~/.ssh/id_rsa"
+    ssh_public_key: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
+    # --- Temp file en Nodo Proxmox ---
+    ssh_key_temp_path_on_node: "/tmp/ansible_sshkey_{{ clone_vm_id }}.pub"
+  tasks:
+    # 1. Clonar
+    - name: "Clone template '{{ template_vm_name }}' to VM {{ clone_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        clone: "{{ template_vm_name }}"
+        newid: "{{ clone_vm_id }}"
+        name: "{{ clone_vm_name }}"
+        state: present
+        timeout: 300
+      register: clone_result
+    # 2. Bloque: Copiar clave, qm set, limpiar clave
+    - name: Manage SSH Key Temp File and Configure VM via qm set
+      delegate_to: "{{ proxmox_node_ip }}"
+      remote_user: root
+      become: false
+      when: clone_result is defined and clone_result is not failed
+      block:
+        - name: Copy SSH public key to temporary file on Proxmox node
+          ansible.builtin.copy:
+            content: "{{ ssh_public_key }}"
+            dest: "{{ ssh_key_temp_path_on_node }}"
+            owner: root
+            group: root
+            mode: '0600'
+        - name: Configure Cloud-Init using qm set with temp key file
+          ansible.builtin.shell:
+            cmd: >
+              qm set {{ clone_vm_id }}
+              --ciuser {{ vm_ssh_user }}
+              --cipassword {{ vm_ci_password_plaintext }}
+              --sshkeys {{ ssh_key_temp_path_on_node }}
+              --ipconfig0 ip={{ new_vm_ip }}/{{ network_cidr }},gw={{ network_gateway }}
+          register: qm_set_result
+          changed_when: qm_set_result.rc == 0
+      always:
+        - name: Remove SSH key temporary file from Proxmox node
+          delegate_to: "{{ proxmox_node_ip }}"
+          remote_user: root
+          become: false
+          ansible.builtin.file:
+            path: "{{ ssh_key_temp_path_on_node }}"
+            state: absent
+          ignore_errors: true
+    # 3. Iniciar VM
+    - name: "Start the configured VM {{ clone_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ clone_vm_id }}"
+        state: started
+        timeout: 120
+      when:
+        - clone_result is defined and clone_result is not failed
+        - qm_set_result is defined and qm_set_result is succeeded
+    # 4. Añadir Host a Inventario
+    - name: "Add VM {{ clone_vm_name }} (IP: {{ new_vm_ip }}) to inventory group 'checkmk_server'"
+      ansible.builtin.add_host:
+        name: "{{ new_vm_ip }}"
+        groups: checkmk_server
+        ansible_user: "{{ vm_ssh_user }}"
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path | expanduser }}"
+        ansible_host_vars: # Variables específicas para este host
+          checkmk_server_hostname_var: "{{ clone_vm_name }}" # Guardamos el nombre original
+          # No es necesario ansible_host aquí, ya que 'name' es la IP y se usará para la conexión.
+      when:
+        - clone_result is defined and clone_result is not failed
+        - qm_set_result is defined and qm_set_result is succeeded
+
+# --- Play 2: Wait for SSH on New VM and Test Connection ---
+- name: Play 2 - Wait for SSH on New Server VM and Test Connection
+  hosts: checkmk_server
+  gather_facts: false
+  become: false
+  tasks:
+    - name: "Wait for SSH port 22 on {{ inventory_hostname }}"
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}" # inventory_hostname es la IP aquí
+        port: 22
+        delay: 30
+        timeout: 300
+        state: started
+      delegate_to: localhost
+
+    - name: Gather facts from the new VM (Test connection and get info)
+      ansible.builtin.gather_facts: {} # Esto poblará ansible_hostname, ansible_default_ipv4 etc.
+
+    - name: Test SSH connection using ping module
+      ansible.builtin.ping:
+
+    - name: Display connection success message
+      ansible.builtin.debug:
+        msg: "SSH Connection to {{ inventory_hostname }} (OS Hostname: {{ ansible_hostname }}) successful!"
+
+# --- Play 3: Prepare OS Dependencies for Checkmk SERVER ---
+- name: Play 3 - Prepare OS Dependencies for Checkmk Server
+  hosts: checkmk_server
+  gather_facts: false # Ya los recogimos en Play 2, pero gather_facts es por host. No hace daño.
+  become: yes
+  vars:
+    server_base_dependencies:
+      - wget
+      - ca-certificates
+      - postfix
+      - gnupg
+      - apt-transport-https
+      - git
+  tasks:
+    - name: Wait for cloud-init to finish first boot setup
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init_status
+      changed_when: "'status: done' in cloud_init_status.stdout"
+      failed_when: "cloud_init_status.rc != 0 and 'status: done' not in cloud_init_status.stdout"
+      until: "'status: done' in cloud_init_status.stdout"
+      retries: 8
+      delay: 30
+
+    - name: Show cloud-init final status
+      ansible.builtin.debug:
+        msg: "Cloud-init finished. RC={{ cloud_init_status.rc }}, STDOUT={{ cloud_init_status.stdout }}"
+      when: cloud_init_status is defined
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      register: apt_update_result
+      until: apt_update_result is succeeded
+      retries: 5
+      delay: 15
+      when:
+        - cloud_init_status is defined
+        - cloud_init_status.rc == 0 or 'status: done' in cloud_init_status.stdout
+
+    - name: Pre-seed postfix configuration - Type
+      ansible.builtin.debconf:
+        name: postfix
+        question: postfix/main_mailer_type
+        value: 'Internet Site'
+        vtype: select
+      when:
+        - cloud_init_status is defined
+        - cloud_init_status.rc == 0 or 'status: done' in cloud_init_status.stdout
+        - apt_update_result is succeeded
+
+    - name: Pre-seed postfix configuration - Mail Name
+      ansible.builtin.debconf:
+        name: postfix
+        question: postfix/mailname
+        value: "{{ ansible_hostname | default(inventory_hostname) }}" # ansible_hostname es del gather_facts del Play 2
+        vtype: string
+      when:
+        - cloud_init_status is defined
+        - cloud_init_status.rc == 0 or 'status: done' in cloud_init_status.stdout
+        - apt_update_result is succeeded
+
+    - name: Install base server dependencies (including git)
+      ansible.builtin.apt:
+        name: "{{ server_base_dependencies }}"
+        state: present
+        update_cache: no # Cache ya actualizado
+      register: apt_install_deps_result
+      until: apt_install_deps_result is succeeded
+      retries: 5
+      delay: 20
+      when:
+        - cloud_init_status is defined
+        - cloud_init_status.rc == 0 or 'status: done' in cloud_init_status.stdout
+        - apt_update_result is succeeded
+
+    - name: Display base dependencies installation success
+      ansible.builtin.debug:
+        msg: "Base server dependencies (including postfix and git) installed successfully."
+      when: apt_install_deps_result is succeeded
+
+    - name: Create user 'lau'
+      ansible.builtin.user:
+        name: lau
+        state: present
+        password: "{{ 'root1' }}" # Usar password_hash
+        groups: sudo
+        append: yes
+        create_home: yes
+        shell: /bin/bash
+      when: apt_install_deps_result is succeeded
+
+    - name: Create user 'guest'
+      ansible.builtin.user:
+        name: guest
+        state: present
+        password: "{{ 'root1'  }}" # Usar password_hash
+        create_home: yes
+        shell: /bin/bash
+      when: apt_install_deps_result is succeeded
+
+    - name: Display OS user creation success
+      ansible.builtin.debug:
+        msg: "OS users 'lau' (with sudo) and 'guest' (no sudo) created successfully."
+      when: apt_install_deps_result is succeeded
+
+# --- Play 4: Instalar Checkmk y Configurar vía API (Estilo Colección Oficial) ---
+- name: Play 4 - Instalar Checkmk y Configurar Hosts/Carpetas vía API
+  hosts: checkmk_server
+  become: yes
+  vars:
+    # ... (todas las vars se mantienen igual que en la versión anterior que funcionó para crear hosts) ...
+    checkmk_server_download_url: "https://download.checkmk.com/checkmk/2.3.0p30/check-mk-raw-2.3.0p30_0.noble_amd64.deb"
+    checkmk_tmp_deb_path: "/tmp/checkmk-installer.deb"
+    checkmk_server_protocol: "http" 
+    checkmk_var_server_address: "{{ inventory_hostname }}" 
+    checkmk_var_site_name: "monitor"
+    checkmk_var_automation_user: "cmkadmin"
+    checkmk_var_automation_secret: "root1" 
+    omd_site_root: "/omd/sites/{{ checkmk_var_site_name }}"
+
+    checkmk_var_folders:
+      - path: "/"
+        name: "Main" 
+      - path: "/Network"
+        name: "Network Devices"
+      - path: "/Network/DNS"
+        name: "DNS Servers"
+      - path: "/Servers"
+        name: "Application Servers"
+      - path: "/Servers/Linux"
+        name: "Linux Servers"
+      - path: "/External"
+        name: "External Services"
+
+    checkmk_var_hosts_to_create:
+      - name: "{{ hostvars[inventory_hostname]['ansible_hostname'] | default(hostvars[inventory_hostname]['checkmk_server_hostname_var']) }}"
+        folder_path: "/Servers/Linux"
+        attributes:
+          ipaddress: "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
+          alias: "{{ hostvars[inventory_hostname]['ansible_hostname'] | default(hostvars[inventory_hostname]['checkmk_server_hostname_var']) }} (CMK Server)"
+          site: "{{ checkmk_var_site_name }}" 
+      - name: "google-primary-dns"
+        folder_path: "/Network/DNS"
+        attributes:
+          ipaddress: "8.8.8.8"
+          alias: "Google Primary DNS"
+          site: "{{ checkmk_var_site_name }}"
+      - name: "cloudflare-primary-dns"
+        folder_path: "/Network/DNS"
+        attributes:
+          ipaddress: "1.1.1.1"
+          alias: "Cloudflare Primary DNS"
+          site: "{{ checkmk_var_site_name }}"
+
+  tasks:
+    # ... (tareas de instalación, creación de sitio, inicio de sitio, contraseña cmkadmin se mantienen igual) ...
+    - name: Descargar paquete del servidor Checkmk (.deb)
+      ansible.builtin.get_url:
+        url: "{{ checkmk_server_download_url }}"
+        dest: "{{ checkmk_tmp_deb_path }}"
+        mode: '0644'
+      register: download_result
+      until: download_result is succeeded
+      retries: 3
+      delay: 10
+
+    - name: Instalar servidor Checkmk desde el paquete .deb descargado
+      ansible.builtin.apt:
+        deb: "{{ checkmk_tmp_deb_path }}"
+        state: present
+      register: apt_install_cmk_result
+      until: apt_install_cmk_result is succeeded
+      retries: 3
+      delay: 20
+      when: download_result is succeeded
+
+    - name: Crear sitio de monitorización OMD '{{ checkmk_var_site_name }}'
+      ansible.builtin.shell:
+        cmd: "omd create --admin-password {{ checkmk_var_automation_secret | quote }} {{ checkmk_var_site_name }}"
+        creates: "{{ omd_site_root }}/etc" 
+      register: omd_create_result
+      changed_when: "'Created new site' in omd_create_result.stdout"
+      failed_when: >
+        omd_create_result.rc != 0 and
+        'already exists' not in omd_create_result.stderr | lower and
+        'already exists' not in omd_create_result.stdout | lower
+      when: apt_install_cmk_result is succeeded
+
+    - name: Iniciar sitio de monitorización OMD '{{ checkmk_var_site_name }}' (arranque inicial)
+      ansible.builtin.command:
+        cmd: "omd start {{ checkmk_var_site_name }}"
+      register: omd_start_result_initial
+      changed_when: "'Starting apache...OK' in omd_start_result_initial.stdout or 'Overall state: running' in omd_start_result_initial.stdout"
+      failed_when: omd_start_result_initial.rc != 0 and 'is already running' not in omd_start_result_initial.stdout
+      when:
+        - apt_install_cmk_result is succeeded
+        - omd_create_result is defined and (omd_create_result.rc == 0 or 'already exists' in omd_create_result.stderr | lower or 'already exists' in omd_create_result.stdout | lower)
+
+    - name: "Establecer contraseña para el usuario '{{ checkmk_var_automation_user }}' dentro del sitio OMD"
+      ansible.builtin.shell:
+        cmd: >
+          su - {{ checkmk_var_site_name }} -s /bin/bash -c
+          "echo {{ checkmk_var_automation_secret | quote }} | cmk-passwd --stdin {{ checkmk_var_automation_user }}"
+        executable: /bin/bash
+      no_log: true 
+      changed_when: true 
+      when:
+        - omd_start_result_initial is defined
+        - omd_start_result_initial.rc == 0 or 'is already running' in omd_start_result_initial.stdout or 'Overall state: running' in omd_start_result_initial.stdout
+
+    # --- BLOQUE DE CONFIGURACIÓN VÍA API CHECKMK (Tareas delegadas a localhost) ---
+
+    - name: "Asegurar que las carpetas existen en Checkmk"
+      checkmk.general.folder:
+        server_url: "{{ checkmk_server_protocol }}://{{ checkmk_var_server_address }}" 
+        site: "{{ checkmk_var_site_name }}"
+        automation_user: "{{ checkmk_var_automation_user }}"
+        automation_secret: "{{ checkmk_var_automation_secret }}"
+        path: "{{ item.path }}"
+        name: "{{ item.name }}" 
+        state: "present"
+      delegate_to: localhost
+      run_once: true 
+      become: no
+      loop: "{{ checkmk_var_folders }}"
+      when:
+        - omd_start_result_initial is defined
+        - (omd_start_result_initial.rc == 0 or 'is already running' in omd_start_result_initial.stdout or 'Overall state: running' in omd_start_result_initial.stdout)
+        - item.path != "/" 
+
+    - name: "Crear/Actualizar hosts en Checkmk (ATRIBUTOS SIMPLIFICADOS)"
+      checkmk.general.host:
+        server_url: "{{ checkmk_server_protocol }}://{{ checkmk_var_server_address }}" 
+        site: "{{ checkmk_var_site_name }}"
+        automation_user: "{{ checkmk_var_automation_user }}"
+        automation_secret: "{{ checkmk_var_automation_secret }}"
+        name: "{{ item.name }}" 
+        folder: "{{ item.folder_path }}"
+        attributes: "{{ item.attributes }}"
+        state: "present"
+      delegate_to: localhost
+      become: no
+      loop: "{{ checkmk_var_hosts_to_create }}"
+      register: host_creation_result
+      when:
+        - omd_start_result_initial is defined
+        - (omd_start_result_initial.rc == 0 or 'is already running' in omd_start_result_initial.stdout or 'Overall state: running' in omd_start_result_initial.stdout)
+
+    - name: "Activar cambios en el sitio Checkmk" # <--- TAREA MODIFICADA
+      checkmk.general.activation:
+        server_url: "{{ checkmk_server_protocol }}://{{ checkmk_var_server_address }}" 
+        automation_user: "{{ checkmk_var_automation_user }}"
+        automation_secret: "{{ checkmk_var_automation_secret }}"
+        force_foreign_changes: true
+        # Opción 1: Usar 'site' en singular si solo activas un sitio (preferido aquí)
+        site: "{{ checkmk_var_site_name }}"
+        # Opción 2: Si se usa 'sites' (lista), asegurar que el módulo no requiera 'site' adicionalmente.
+        # sites: 
+        #   - "{{ checkmk_var_site_name }}"
+      delegate_to: localhost
+      run_once: true
+      become: no
+      register: activation_result
+      when:
+        - omd_start_result_initial is defined
+        - (omd_start_result_initial.rc == 0 or 'is already running' in omd_start_result_initial.stdout or 'Overall state: running' in omd_start_result_initial.stdout)
+        - host_creation_result is defined and host_creation_result.changed 
+
+    - name: "DEBUG - Mostrar resultado de la creación de hosts"
+      ansible.builtin.debug:
+        var: host_creation_result
+      delegate_to: localhost
+      run_once: true
+      become: no
+      when: host_creation_result is defined
+
+    - name: "DEBUG - Mostrar resultado de la activación"
+      ansible.builtin.debug:
+        var: activation_result
+      delegate_to: localhost
+      run_once: true
+      become: no
+      when: activation_result is defined
+
+# --- Play 5: Configurar Firewall (UFW) ---
+- name: Play 5 - Configure Firewall (UFW)
+  hosts: checkmk_server
+  gather_facts: false
+  become: yes
+  vars:
+    # Estas variables se pueden tomar de las globales o definirlas aquí
+    # checkmk_var_site_name y checkmk_var_automation_secret ya están definidas en Play 4
+    # pero las re-defino aquí para que Play 5 sea autónomo si se corre solo (aunque depende de Play 4)
+    checkmk_site_name_for_msg: "{{ checkmk_var_site_name | default('monitor') }}"
+    checkmk_admin_password_for_msg: "{{ checkmk_var_automation_secret | default('root1') }}"
+  tasks:
+    - name: Ensure UFW is installed
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+
+    - name: Allow incoming SSH connections
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH # Usa el perfil de la aplicación
+      notify: Enable UFW
+
+    - name: Allow incoming Checkmk Web UI connections (Port 80/HTTP)
+      community.general.ufw:
+        rule: allow
+        port: '80' # Asumiendo HTTP. Si es HTTPS, puerto 443
+        proto: tcp
+      notify: Enable UFW
+
+    - name: Allow incoming Checkmk Agent connections (Port 6556/TCP)
+      community.general.ufw:
+        rule: allow
+        port: '6556'
+        proto: tcp
+      notify: Enable UFW
+
+    # Forzar ejecución de handlers de UFW AHORA
+    - name: Flush UFW handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Display Final Completion Message
+      ansible.builtin.debug:
+        msg: |
+          Ansible playbook execution finished.
+          Checkmk site '{{ checkmk_site_name_for_msg }}' installed and configuration potentially applied.
+          Firewall (UFW) is configured and enabled.
+          --> PLEASE CHECK THE CHECKMK UI MANUALLY: {{ checkmk_var_server_protocol | default('http') }}://{{ inventory_hostname }}/{{ checkmk_site_name_for_msg }}/ <--
+          Login: {{ checkmk_var_automation_user | default('cmkadmin') }} / {{ checkmk_admin_password_for_msg }}
+          Check activation_result debug output above for success/failure of applying changes.
+
+  # --- Handlers ---
+  handlers:
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled
+      listen: "Enable UFW"
+
+  # --- FIN DEL ARCHIVO ---
